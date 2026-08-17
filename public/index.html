@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#f7f8fc">
+  <title>Harkly — conversations that feel easy</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+  <main id="app">
+    <section id="authView" class="auth-layout">
+      <div class="auth-visual">
+        <div class="grain"></div>
+        <header class="brand light"><span class="brand-dot"></span>harkly</header>
+        <div class="visual-copy">
+          <span class="eyebrow">A softer way to stay close</span>
+          <h1>Good conversations<br><em>start here.</em></h1>
+          <p>Find your people, make space for the everyday, and keep the little moments close.</p>
+        </div>
+        <div class="floating-note note-one"><span class="mini-avatar avatar-lilac">A</span><div><strong>Amelia</strong><small>Sent you a voice note</small></div><span class="note-time">now</span></div>
+        <div class="floating-note note-two"><span class="mini-avatar avatar-peach">J</span><div><strong>James is typing</strong><small>✦ just a second...</small></div></div>
+        <div class="visual-orbit"></div>
+      </div>
+      <div class="auth-panel">
+        <div class="auth-content">
+          <div class="mobile-brand brand"><span class="brand-dot"></span>harkly</div>
+          <div class="auth-heading">
+            <span class="eyebrow" id="authEyebrow">WELCOME BACK</span>
+            <h2 id="authTitle">Come on in.</h2>
+            <p id="authSubtitle">Your people are only a message away.</p>
+          </div>
+          <div class="auth-tabs"><button class="auth-tab active" data-auth="signin">Sign in</button><button class="auth-tab" data-auth="signup">Create account</button></div>
+          <form id="authForm" class="auth-form">
+            <label id="displayNameField" class="field hidden"><span>Your name</span><input name="displayName" autocomplete="name" placeholder="What should people call you?"></label>
+            <label class="field"><span id="identifierLabel">Username</span><div class="input-prefix"><b>@</b><input required name="identifier" autocomplete="username" placeholder="yourusername" maxlength="24"></div></label>
+            <label class="field"><span>Password</span><div class="password-wrap"><input required name="password" type="password" autocomplete="current-password" placeholder="At least 8 characters"><button type="button" class="show-password" aria-label="Show password">Show</button></div></label>
+            <div id="authError" class="form-error" role="alert"></div>
+            <button class="primary-button wide" type="submit"><span id="authButtonText">Sign in to Harkly</span><span class="button-arrow">↗</span></button>
+          </form>
+          <p class="auth-footnote" id="authFootnote">New here? <button type="button" data-switch-auth="signup">Create a free account</button></p>
+          <div class="privacy-note"><span>✦</span><span>Your conversations are yours. We protect your account with secure password hashing.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="appView" class="app-layout hidden">
+      <aside class="sidebar">
+        <div class="sidebar-top"><div class="brand"><span class="brand-dot"></span>harkly</div><button id="mobileCloseSidebar" class="icon-button mobile-only">×</button></div>
+        <div class="profile-card"><span id="profileAvatar" class="avatar avatar-lilac">Y</span><div class="profile-info"><strong id="profileName">Your name</strong><span id="profileUsername">@username</span></div><button id="profileMenu" class="more-button">•••</button></div>
+        <nav class="main-nav">
+          <button class="nav-item active" data-panel="chats"><span class="nav-icon">◒</span><span>Chats</span><span id="chatCount" class="nav-count hidden">0</span></button>
+          <button class="nav-item" data-panel="discover"><span class="nav-icon">⌕</span><span>Discover people</span></button>
+          <button class="nav-item" data-panel="requests"><span class="nav-icon">♧</span><span>Requests</span><span id="requestCount" class="nav-count hidden">0</span></button>
+        </nav>
+        <div class="sidebar-bottom"><div class="sidebar-tip"><span>✦</span><div><strong>Keep it human</strong><p>A little kindness goes a long way.</p></div></div><button id="logoutButton" class="logout-button">↪ <span>Sign out</span></button></div>
+      </aside>
+      <div id="sidebarOverlay" class="sidebar-overlay hidden"></div>
+      <section class="panel">
+        <header class="panel-header">
+          <div><span class="eyebrow" id="panelEyebrow">YOUR SPACE</span><h2 id="panelTitle">Chats <span id="panelTitleCount"></span></h2></div>
+          <div class="panel-actions"><button id="notificationButton" class="round-button" aria-label="Notifications"><span>♧</span><i id="notificationDot" class="notification-dot hidden"></i></button><button id="mobileMenu" class="round-button mobile-only">☰</button></div>
+        </header>
+        <div id="chatsPanel" class="panel-body">
+          <div class="search-box"><span>⌕</span><input id="chatSearch" placeholder="Search your chats"></div>
+          <div id="chatList" class="chat-list"></div>
+          <div id="emptyChats" class="empty-state hidden"><div class="empty-orbit">◒</div><h3>Your space is quiet</h3><p>Find someone new to talk to, or wait for a connection to come through.</p><button class="text-button" data-panel-link="discover">Discover people ↗</button></div>
+        </div>
+        <div id="discoverPanel" class="panel-body hidden">
+          <div class="discover-intro"><div><h3>Find your people</h3><p>Search by name or exact @username.</p></div><span class="discover-mark">⌕</span></div>
+          <div class="search-box large"><span>⌕</span><input id="peopleSearch" placeholder="Try “@amelia” or “James”" autocomplete="off"></div>
+          <div id="peopleResults" class="people-results"><div class="discover-placeholder"><span>✦</span><p>Start typing to discover someone new.</p></div></div>
+        </div>
+        <div id="requestsPanel" class="panel-body hidden">
+          <div class="requests-heading"><h3>Connection requests</h3><p>Open a door to a new conversation.</p></div>
+          <div id="incomingRequests"></div><div id="outgoingRequests"></div>
+        </div>
+      </section>
+      <section id="conversation" class="conversation empty-conversation">
+        <div class="conversation-empty-art"><span class="empty-ring"></span><span class="empty-spark">✦</span><span class="empty-bubble">•••</span></div><h2>Choose a conversation</h2><p>Pick a chat from your space and make a little room for connection.</p>
+      </section>
+    </section>
+  </main>
+  <div id="toastStack" class="toast-stack"></div>
+  <div id="notificationPanel" class="notification-panel hidden"><div class="notification-header"><h3>Notifications</h3><button id="closeNotifications" class="icon-button">×</button></div><div id="notificationList"></div></div>
+  <script src="/app.js"></script>
+</body>
+</html>
