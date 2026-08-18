@@ -1,5 +1,6 @@
 const express = require("express");
 const session = require("express-session");
+const SessionStore = session.Store;
 const bcrypt = require("bcryptjs");
 const Database = require("better-sqlite3");
 const multer = require("multer");
@@ -19,6 +20,11 @@ const db = new Database(path.join(DATA_DIR, "harkly.db"));
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    sid TEXT PRIMARY KEY,
+    sess TEXT NOT NULL,
+    expires INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -66,22 +72,67 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, is_read, created_at);
 `);
 
+class SQLiteSessionStore extends SessionStore {
+  get(sid, callback) {
+    try {
+      const row = db.prepare("SELECT sess, expires FROM sessions WHERE sid = ?").get(sid);
+      if (!row || row.expires <= Date.now()) {
+        if (row) db.prepare("DELETE FROM sessions WHERE sid = ?").run(sid);
+        return callback(null, null);
+      }
+      callback(null, JSON.parse(row.sess));
+    } catch (error) { callback(error); }
+  }
+  set(sid, sess, callback) {
+    try {
+      const expires = sess.cookie?.expires ? new Date(sess.cookie.expires).getTime() : Date.now() + 7 * 86400000;
+      db.prepare("INSERT INTO sessions (sid, sess, expires) VALUES (?, ?, ?) ON CONFLICT(sid) DO UPDATE SET sess = excluded.sess, expires = excluded.expires")
+        .run(sid, JSON.stringify(sess), expires);
+      callback?.(null);
+    } catch (error) { callback?.(error); }
+  }
+  destroy(sid, callback) {
+    try { db.prepare("DELETE FROM sessions WHERE sid = ?").run(sid); callback?.(null); }
+    catch (error) { callback?.(error); }
+  }
+  touch(sid, sess, callback) { this.set(sid, sess, callback); }
+}
+
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+if (!process.env.SESSION_SECRET) console.warn("SESSION_SECRET is not set; use a persistent secret in production.");
+if (process.env.NODE_ENV === "production") app.set("trust proxy", 1);
+app.disable("x-powered-by");
+app.use(express.json({ limit: "100kb" }));
+app.use(express.urlencoded({ extended: true, limit: "100kb" }));
 app.use(session({
+  name: "harkly.sid",
   secret: sessionSecret,
+  store: new SQLiteSessionStore(),
   resave: false,
   saveUninitialized: false,
+  rolling: true,
+  proxy: process.env.NODE_ENV === "production",
   cookie: {
     httpOnly: true,
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
-    maxAge: 1000 * 60 * 60 * 24 * 30
+    maxAge: 1000 * 60 * 60 * 24 * 7
   }
 }));
 app.use(express.static(path.join(ROOT, "public"), { maxAge: process.env.NODE_ENV === "production" ? "1h" : 0 }));
-app.use("/uploads", express.static(UPLOAD_DIR, { maxAge: "1h" }));
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  if (req.path.startsWith("/api/")) res.setHeader("Cache-Control", "no-store");
+  next();
+});
+app.use("/api", (req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  const origin = req.get("origin");
+  if (origin && origin !== `${req.protocol}://${req.get("host")}`) return res.status(403).json({ error: "That request did not come from this app." });
+  next();
+});
 
 const allowedTypes = new Set([
   "image/jpeg", "image/png", "image/gif", "image/webp",
@@ -93,15 +144,67 @@ const upload = multer({
     destination: UPLOAD_DIR,
     filename: (_req, file, cb) => cb(null, `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${path.extname(file.originalname).toLowerCase()}`)
   }),
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => cb(null, allowedTypes.has(file.mimetype))
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    if (allowedTypes.has(file.mimetype)) return cb(null, true);
+    const error = new Error("That file type isn't supported.");
+    error.statusCode = 400;
+    cb(error);
+  }
 });
 
 const typingUsers = new Map();
 const authAttempts = new Map();
+const rateBuckets = new Map();
+const eventClients = new Map();
 const colors = ["#8d7bff", "#ff8d8d", "#63c8a3", "#f0b86c", "#6eafff", "#d879c7"];
 
 function now() { return new Date().toISOString(); }
+function rateLimit({ windowMs = 60_000, max = 30, key = (req) => req.ip } = {}) {
+  return (req, res, next) => {
+    const bucketKey = key(req);
+    const current = rateBuckets.get(bucketKey);
+    const timestamp = Date.now();
+    if (!current || timestamp - current.startedAt >= windowMs) {
+      rateBuckets.set(bucketKey, { startedAt: timestamp, count: 1 });
+      return next();
+    }
+    current.count += 1;
+    if (current.count > max) {
+      const retryAfter = Math.ceil((windowMs - (timestamp - current.startedAt)) / 1000);
+      res.set("Retry-After", String(retryAfter));
+      return res.status(429).json({ error: "You’re doing that a little too quickly. Please try again shortly." });
+    }
+    next();
+  };
+}
+function sendEvent(userId, event, payload) {
+  const clients = eventClients.get(Number(userId));
+  if (!clients) return;
+  const packet = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const client of clients) {
+    try { client.res.write(packet); } catch { clients.delete(client); }
+  }
+}
+function sessionLogin(req, userId, callback) {
+  req.session.regenerate((error) => {
+    if (error) return callback(error);
+    req.session.userId = Number(userId);
+    req.session.save(callback);
+  });
+}
+setInterval(() => {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [key, value] of rateBuckets) if (value.startedAt < cutoff) rateBuckets.delete(key);
+  db.prepare("DELETE FROM sessions WHERE expires <= ?").run(Date.now());
+  const typingCutoff = Date.now() - 6000;
+  for (const [userId, typing] of typingUsers) {
+    if (typing.at < typingCutoff) {
+      typingUsers.delete(userId);
+      sendEvent(typing.targetId, "typing", { fromUserId: userId, isTyping: false });
+    }
+  }
+}, 60_000).unref();
 function cleanUsername(input) {
   return String(input || "").trim().replace(/^@/, "").toLowerCase();
 }
@@ -127,6 +230,14 @@ function requireAuth(req, res, next) {
   db.prepare("UPDATE users SET is_online = 1, last_seen = ? WHERE id = ?").run(now(), user.id);
   next();
 }
+app.get("/uploads/:filename", requireAuth, (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const file = db.prepare("SELECT sender_id, receiver_id, file_path FROM messages WHERE file_path = ?").get(`/uploads/${filename}`);
+  const canView = file && ([file.sender_id, file.receiver_id].includes(req.user.id) || isConnected(req.user.id, file.sender_id));
+  if (!canView) return res.status(404).end();
+  res.setHeader("Cache-Control", "private, max-age=3600");
+  res.sendFile(path.join(UPLOAD_DIR, filename));
+});
 function sanitizeMessage(row, viewerId) {
   return {
     id: row.id, senderId: row.sender_id, receiverId: row.receiver_id,
@@ -154,7 +265,7 @@ app.get("/api/me", (req, res) => {
   res.json({ user: null });
 });
 
-app.post("/api/auth/signup", (req, res) => {
+app.post("/api/auth/signup", rateLimit({ windowMs: 10 * 60_000, max: 8 }), (req, res) => {
   const username = cleanUsername(req.body.username);
   const displayName = String(req.body.displayName || "").trim();
   const password = String(req.body.password || "");
@@ -167,15 +278,17 @@ app.post("/api/auth/signup", (req, res) => {
     const result = db.prepare(`INSERT INTO users (username, display_name, password_hash, avatar_color)
       VALUES (?, ?, ?, ?)`).run(username, displayName, hash, colors[Math.floor(Math.random() * colors.length)]);
     db.prepare("UPDATE users SET is_online = 1, last_seen = ? WHERE id = ?").run(now(), result.lastInsertRowid);
-    req.session.userId = result.lastInsertRowid;
-    res.status(201).json({ user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid)) });
+    sessionLogin(req, result.lastInsertRowid, (error) => {
+      if (error) return res.status(500).json({ error: "We couldn't start your secure session. Please try again." });
+      res.status(201).json({ user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid)) });
+    });
   } catch (error) {
     if (String(error.message).includes("UNIQUE")) return res.status(409).json({ error: "That username is already taken. Try another one." });
     res.status(500).json({ error: "We couldn't create your account. Please try again." });
   }
 });
 
-app.post("/api/auth/signin", (req, res) => {
+app.post("/api/auth/signin", rateLimit({ windowMs: 10 * 10 * 60_000, max: 12 }), (req, res) => {
   const identifier = cleanUsername(req.body.identifier);
   const password = String(req.body.password || "");
   const key = `signin:${req.ip}`;
@@ -187,14 +300,27 @@ app.post("/api/auth/signin", (req, res) => {
     return res.status(401).json({ error: "That username or password doesn't look right." });
   }
   authAttempts.delete(key);
-  req.session.userId = user.id;
-  db.prepare("UPDATE users SET is_online = 1, last_seen = ? WHERE id = ?").run(now(), user.id);
-  res.json({ user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(user.id)) });
+  sessionLogin(req, user.id, (error) => {
+    if (error) return res.status(500).json({ error: "We couldn't start your secure session. Please try again." });
+    db.prepare("UPDATE users SET is_online = 1, last_seen = ? WHERE id = ?").run(now(), user.id);
+    res.json({ user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(user.id)) });
+  });
 });
 
 app.post("/api/auth/logout", (req, res) => {
   if (req.session.userId) db.prepare("UPDATE users SET is_online = 0, last_seen = ? WHERE id = ?").run(now(), req.session.userId);
   req.session.destroy(() => res.json({ ok: true }));
+});
+
+app.get("/api/events", requireAuth, (req, res) => {
+  res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  res.flushHeaders?.();
+  res.write(`event: ready\ndata: ${JSON.stringify({ userId: req.user.id })}\n\n`);
+  const client = { res };
+  if (!eventClients.has(req.user.id)) eventClients.set(req.user.id, new Set());
+  eventClients.get(req.user.id).add(client);
+  const heartbeat = setInterval(() => { try { res.write(": keep-alive\n\n"); } catch {} }, 20_000);
+  req.on("close", () => { clearInterval(heartbeat); eventClients.get(req.user.id)?.delete(client); });
 });
 
 app.get("/api/people", requireAuth, (req, res) => {
@@ -217,7 +343,7 @@ app.get("/api/requests", requireAuth, (req, res) => {
   res.json({ incoming: incoming.map(map), outgoing: outgoing.map(map) });
 });
 
-app.post("/api/requests/:userId", requireAuth, (req, res) => {
+app.post("/api/requests/:userId", requireAuth, rateLimit({ max: 12, key: (req) => `requests:${req.user.id}` }), (req, res) => {
   const targetId = Number(req.params.userId);
   if (!targetId || targetId === req.user.id) return res.status(400).json({ error: "That connection isn't available." });
   const target = db.prepare("SELECT * FROM users WHERE id = ?").get(targetId);
@@ -235,6 +361,7 @@ app.post("/api/requests/:userId", requireAuth, (req, res) => {
     request = { id: result.lastInsertRowid };
   }
   makeNotification(targetId, "request", `${req.user.display_name} wants to connect`, `@${req.user.username} sent you a connection request.`, request.id);
+  sendEvent(targetId, "notification", { kind: "request", title: `${req.user.display_name} wants to connect`, body: `@${req.user.username} sent you a connection request.` });
   res.status(201).json({ ok: true, message: "Request sent." });
 });
 
@@ -247,6 +374,7 @@ app.patch("/api/requests/:id", requireAuth, (req, res) => {
   db.prepare("UPDATE connection_requests SET status = ?, updated_at = ? WHERE id = ?").run(status, now(), request.id);
   const sender = db.prepare("SELECT * FROM users WHERE id = ?").get(request.sender_id);
   if (action === "accept") makeNotification(sender.id, "accepted", `${req.user.display_name} accepted your request`, "You can now start chatting.", request.id);
+  if (action === "accept") sendEvent(sender.id, "notification", { kind: "accepted", title: `${req.user.display_name} accepted your request`, body: "You can now start chatting." });
   res.json({ ok: true, status, user: publicUser(sender) });
 });
 
@@ -272,7 +400,7 @@ app.get("/api/chats/:userId/messages", requireAuth, (req, res) => {
   res.json({ messages: rows.map((row) => sanitizeMessage(row, req.user.id)) });
 });
 
-app.post("/api/chats/:userId/messages", requireAuth, upload.single("file"), (req, res) => {
+app.post("/api/chats/:userId/messages", requireAuth, rateLimit({ windowMs: 60_000, max: 45, key: (req) => `messages:${req.user.id}` }), upload.single("file"), (req, res) => {
   const otherId = Number(req.params.userId);
   if (!isConnected(req.user.id, otherId)) return res.status(403).json({ error: "Connect with this person to chat." });
   const recipient = db.prepare("SELECT * FROM users WHERE id = ?").get(otherId);
@@ -283,18 +411,25 @@ app.post("/api/chats/:userId/messages", requireAuth, upload.single("file"), (req
   }
   const messageType = req.file ? (req.file.mimetype.startsWith("image/") ? "image" : req.file.mimetype.startsWith("video/") ? "video" : req.file.mimetype.startsWith("audio/") ? "audio" : "file") : "text";
   const content = String(req.body.content || "").trim();
+  if (content.length > 5000) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(400).json({ error: "Messages can be up to 5,000 characters." });
+  }
   if (!req.file && !content) return res.status(400).json({ error: "Write a message or attach a file." });
   const result = db.prepare(`INSERT INTO messages (sender_id, receiver_id, content, message_type, file_name, file_path, file_size)
     VALUES (?, ?, ?, ?, ?, ?, ?)`).run(req.user.id, otherId, content, messageType, req.file?.originalname || null, req.file ? `/uploads/${path.basename(req.file.path)}` : null, req.file?.size || null);
   const message = db.prepare("SELECT * FROM messages WHERE id = ?").get(result.lastInsertRowid);
   const preview = messageType === "text" ? content.slice(0, 80) : `Sent a ${messageType}`;
   makeNotification(otherId, "message", `New message from ${req.user.display_name}`, preview, null, message.id);
+  sendEvent(otherId, "message", { message: sanitizeMessage(message, otherId) });
   res.status(201).json({ message: sanitizeMessage(message, req.user.id) });
 });
 
 app.post("/api/chats/:userId/seen", requireAuth, (req, res) => {
   if (!isConnected(req.user.id, Number(req.params.userId))) return res.status(403).json({ error: "Not connected." });
-  db.prepare("UPDATE messages SET seen_at = ? WHERE sender_id = ? AND receiver_id = ? AND seen_at IS NULL").run(now(), Number(req.params.userId), req.user.id);
+  const seenAt = now();
+  db.prepare("UPDATE messages SET seen_at = ? WHERE sender_id = ? AND receiver_id = ? AND seen_at IS NULL").run(seenAt, Number(req.params.userId), req.user.id);
+  sendEvent(Number(req.params.userId), "seen", { byUserId: req.user.id, seenAt });
   res.json({ ok: true });
 });
 
@@ -305,10 +440,18 @@ app.get("/api/chats/:userId/state", requireAuth, (req, res) => {
   res.json({ isOnline: Boolean(person?.is_online) && person?.last_seen && (Date.now() - new Date(person.last_seen).getTime()) < 20000, lastSeen: person?.last_seen, isTyping: typing?.targetId === req.user.id && Date.now() - typing.at < 5000 });
 });
 
-app.post("/api/presence", requireAuth, (req, res) => {
+app.post("/api/presence", requireAuth, rateLimit({ windowMs: 60_000, max: 120, key: (req) => `presence:${req.user.id}` }), (req, res) => {
   const typingTo = Number(req.body.typingTo);
+  const isTyping = req.body.typing !== false;
   db.prepare("UPDATE users SET is_online = 1, last_seen = ? WHERE id = ?").run(now(), req.user.id);
-  if (typingTo) typingUsers.set(req.user.id, { userId: req.user.id, targetId: typingTo, at: Date.now() });
+  if (typingTo && isTyping) {
+    typingUsers.set(req.user.id, { userId: req.user.id, targetId: typingTo, at: Date.now() });
+    sendEvent(typingTo, "typing", { fromUserId: req.user.id, isTyping: true });
+  } else if (typingUsers.has(req.user.id)) {
+    const previous = typingUsers.get(req.user.id);
+    typingUsers.delete(req.user.id);
+    sendEvent(previous.targetId, "typing", { fromUserId: req.user.id, isTyping: false });
+  }
   res.json({ ok: true });
 });
 
@@ -319,6 +462,18 @@ app.get("/api/notifications", requireAuth, (req, res) => {
 app.post("/api/notifications/read", requireAuth, (req, res) => {
   db.prepare("UPDATE notifications SET is_read = 1 WHERE user_id = ?").run(req.user.id);
   res.json({ ok: true });
+});
+
+app.use((error, _req, res, _next) => {
+  if (error instanceof multer.MulterError) {
+    const message = error.code === "LIMIT_FILE_SIZE" ? "Attachments must be 25 MB or smaller." : "That attachment could not be uploaded.";
+    return res.status(400).json({ error: message });
+  }
+  if (error) {
+    console.error("Request error:", error);
+    return res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Something went wrong while processing that request." });
+  }
+  res.status(404).json({ error: "Not found." });
 });
 
 app.use((_req, res) => res.sendFile(path.join(ROOT, "public", "index.html")));

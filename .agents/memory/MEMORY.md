@@ -1,0 +1,1 @@
+- [Native SQLite runtime](native-sqlite-runtime.md) — keep better-sqlite3 aligned with the workspace Node version; mismatched native binaries can crash the server at startup.

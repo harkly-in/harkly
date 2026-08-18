@@ -8,6 +8,9 @@ Harkly is a calm, mobile-friendly messaging app with a navy, white, black, and p
 - Connection request and acceptance flow
 - Recent chats, unread counts, notifications, online/last-seen state, typing state, and message seen state
 - Text, emoji, image, video, file, and browser voice-message support
+- Instant message, notification, typing, and read-receipt delivery through a reconnecting event stream
+- Durable SQLite-backed sessions with session rotation, secure cookies, request throttling, and upload limits
+- Upload progress feedback and an expanded emoji picker
 
 ## Run
 
@@ -15,7 +18,7 @@ Harkly is a calm, mobile-friendly messaging app with a navy, white, black, and p
 npm run dev
 ```
 
-The app listens on port 5000. The SQLite database is created at `data/harkly.db`, and uploads are stored in `uploads/`. Set `SESSION_SECRET` in the environment for a stable signed session cookie in production; the app uses a secure generated fallback for local development.
+The app listens on port 5000. The SQLite database is created at `data/harkly.db`, sessions are stored in the same database, and uploads are stored in `uploads/`. Set `SESSION_SECRET` in the environment for a stable signed session cookie in production; the app uses a secure generated fallback for local development.
 
 ## User preferences
 

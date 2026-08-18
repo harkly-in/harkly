@@ -1,4 +1,4 @@
-const state = { user: null, panel: "chats", chats: [], selected: null, recording: false, mediaRecorder: null, audioChunks: [], poller: null };
+const state = { user: null, panel: "chats", chats: [], selected: null, recording: false, mediaRecorder: null, audioChunks: [], poller: null, events: null, typingTimer: null, lastTypingAt: 0 };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const esc = (value = "") => String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char]));
@@ -73,13 +73,45 @@ function showApp() {
   loadChats();
   loadRequests();
   loadNotifications();
+  connectEvents();
   clearInterval(state.poller);
-  state.poller = setInterval(() => { loadChats(true); loadNotifications(true); if (state.selected) loadConversation(state.selected.id, true); }, 4500);
+  state.poller = setInterval(() => { loadChats(true); loadNotifications(true); if (state.selected) loadConversation(state.selected.id, true); }, 15000);
 }
 function showAuth() {
   $("#appView").classList.add("hidden");
   $("#authView").classList.remove("hidden");
   clearInterval(state.poller);
+  state.events?.close();
+  state.events = null;
+}
+function connectEvents() {
+  state.events?.close();
+  if (!window.EventSource) return;
+  const events = new EventSource("/api/events");
+  state.events = events;
+  events.addEventListener("message", async (event) => {
+    const { message } = JSON.parse(event.data);
+    if (state.selected?.id === message.senderId || state.selected?.id === message.receiverId) {
+      await loadConversation(state.selected.id, true);
+    }
+    await loadChats(true);
+    await loadNotifications(true);
+  });
+  events.addEventListener("typing", (event) => {
+    const data = JSON.parse(event.data);
+    if (state.selected?.id !== data.fromUserId || !$("#typingLine")) return;
+    $("#typingLine").innerHTML = data.isTyping ? `<span class="typing-card"><span>${esc(state.selected.displayName)} is typing</span><i class="typing-dots"><b></b><b></b><b></b></i></span>` : "";
+  });
+  events.addEventListener("seen", async (event) => {
+    const data = JSON.parse(event.data);
+    if (state.selected?.id === data.byUserId) await loadConversation(state.selected.id, true);
+  });
+  events.addEventListener("notification", async () => {
+    await loadNotifications(true);
+    await loadRequests();
+    toast("You have a new Harkly update.");
+  });
+  events.onerror = () => { /* EventSource reconnects automatically. */ };
 }
 async function loadChats(silent = false) {
   try {
@@ -118,9 +150,9 @@ function renderConversationShell() {
   $("#conversation").innerHTML = `<header class="chat-header"><button class="round-button mobile-only" id="backToChats">‹</button>${avatar(person)}
     <div class="chat-header-info"><strong>${esc(person.displayName)}</strong><span id="presenceLine">${person.isOnline ? "online" : lastSeen(person.lastSeen)}</span></div>
     <div class="chat-header-actions"><button class="round-button" title="More options">•••</button></div></header>
-    <div id="messages" class="messages"></div><div id="typingLine" class="typing"></div>
-    <div class="composer-wrap"><div id="attachmentName" class="attachment-name hidden"></div><div class="reply-composer">
-      <button id="emojiButton" class="composer-button" title="Add emoji">☺</button><button id="attachButton" class="composer-button" title="Attach a file">⊕</button>
+    <div id="messages" class="messages"></div><div id="typingLine" class="typing" aria-live="polite"></div>
+    <div class="composer-wrap"><div id="attachmentName" class="attachment-name hidden"></div><div id="uploadProgress" class="upload-progress hidden"><span></span></div><div class="reply-composer">
+      <button id="emojiButton" class="composer-button" title="Add emoji" aria-label="Add emoji">☺</button><button id="attachButton" class="composer-button" title="Attach a file" aria-label="Attach a file">⊕</button>
       <textarea id="messageInput" rows="1" placeholder="Write a message..." aria-label="Message"></textarea><button id="recordButton" class="composer-button" title="Record voice message">◉</button><button id="sendButton" class="composer-button send" title="Send">↗</button></div></div>`;
   const fileInput = document.createElement("input");
   fileInput.type = "file"; fileInput.id = "fileInput"; fileInput.className = "hidden"; fileInput.accept = "image/*,video/*,audio/*,.pdf,.txt,.zip";
@@ -130,7 +162,14 @@ function renderConversationShell() {
   $("#messageInput").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } });
   $("#messageInput").addEventListener("input", () => {
     $("#messageInput").style.height = "auto"; $("#messageInput").style.height = `${Math.min(100, $("#messageInput").scrollHeight)}px`;
-    api("/api/presence", { method: "POST", body: JSON.stringify({ typingTo: person.id }) }).catch(() => {});
+    const hasText = $("#messageInput").value.trim().length > 0;
+    if (hasText && Date.now() - state.lastTypingAt > 900) {
+      state.lastTypingAt = Date.now();
+      api("/api/presence", { method: "POST", body: JSON.stringify({ typingTo: person.id, typing: true }) }).catch(() => {});
+    }
+    clearTimeout(state.typingTimer);
+    if (hasText) state.typingTimer = setTimeout(() => stopTyping(person.id), 2200);
+    else stopTyping(person.id);
   });
   $("#attachButton").addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", () => { const file = fileInput.files[0]; if (file) { $("#attachmentName").textContent = `Attached: ${file.name}`; $("#attachmentName").classList.remove("hidden"); } });
@@ -169,13 +208,44 @@ async function sendMessage() {
   if (!content && !file) return;
   const form = new FormData(); if (content) form.append("content", content); if (file) form.append("file", file);
   $("#sendButton").disabled = true;
-  try { await api(`/api/chats/${state.selected.id}/messages`, { method: "POST", body: form }); input.value = ""; input.style.height = "auto"; fileInput.value = ""; $("#attachmentName").classList.add("hidden"); await loadConversation(state.selected.id); await loadChats(true); }
+  stopTyping(state.selected.id);
+  try {
+    const data = file ? await uploadMessage(`/api/chats/${state.selected.id}/messages`, form) : await api(`/api/chats/${state.selected.id}/messages`, { method: "POST", body: form });
+    input.value = ""; input.style.height = "auto"; fileInput.value = ""; $("#attachmentName").classList.add("hidden"); $("#uploadProgress").classList.add("hidden");
+    await loadConversation(state.selected.id); await loadChats(true);
+    if (data.message) toast(file ? "Attachment sent securely." : "Message sent.");
+  }
   catch (error) { toast(error.message, true); } finally { $("#sendButton").disabled = false; }
+}
+function stopTyping(userId) {
+  clearTimeout(state.typingTimer);
+  if (userId) api("/api/presence", { method: "POST", body: JSON.stringify({ typingTo: userId, typing: false }) }).catch(() => {});
+}
+function uploadMessage(url, form) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", url);
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable || !$("#uploadProgress")) return;
+      $("#uploadProgress").classList.remove("hidden");
+      $("#uploadProgress span").style.width = `${Math.round(event.loaded / event.total * 100)}%`;
+    };
+    request.onload = () => {
+      const data = JSON.parse(request.responseText || "{}");
+      if (request.status >= 200 && request.status < 300) resolve(data);
+      else reject(new Error(data.error || "The attachment could not be sent."));
+    };
+    request.onerror = () => reject(new Error("The upload was interrupted. Check your connection and try again."));
+    request.send(form);
+  });
 }
 function showEmojiTray() {
   const existing = $("#emojiTray"); if (existing) return existing.remove();
-  const tray = document.createElement("div"); tray.id = "emojiTray"; tray.style.cssText = "position:absolute;bottom:70px;background:#fff;border:1px solid #e9e8ef;border-radius:10px;padding:10px;display:flex;gap:8px;flex-wrap:wrap;width:190px;box-shadow:0 12px 30px rgba(45,39,91,.12);font-size:20px";
-  ["😊", "🙌", "✨", "🤍", "😂", "🥹", "👋", "💬", "🌿", "☕", "🎉", "❤️"].forEach((emoji) => { const button = document.createElement("button"); button.textContent = emoji; button.addEventListener("click", () => { $("#messageInput").value += emoji; tray.remove(); $("#messageInput").focus(); }); tray.appendChild(button); });
+  const tray = document.createElement("div"); tray.id = "emojiTray"; tray.className = "emoji-tray";
+  tray.innerHTML = `<div class="emoji-tray-header"><strong>Choose a reaction</strong><button type="button" aria-label="Close emoji picker">×</button></div><div class="emoji-grid"></div>`;
+  const emojis = ["😀","😃","😄","😁","😆","😅","😂","🤣","🥹","😊","😇","🙂","🙃","😉","😍","🥰","😘","😋","😎","🤩","🥳","🤗","🤔","😮","😴","😭","😤","😱","🤍","🩷","❤️","🧡","💛","💚","💙","💜","🖤","✨","⭐","🔥","🎉","🙌","👏","👋","🤝","🙏","💪","🫶","💬","✅","🌿","☕","🍕","🎵","🎁"];
+  emojis.forEach((emoji) => { const button = document.createElement("button"); button.type = "button"; button.textContent = emoji; button.addEventListener("click", () => { $("#messageInput").value += emoji; tray.remove(); $("#messageInput").focus(); }); tray.querySelector(".emoji-grid").appendChild(button); });
+  tray.querySelector(".emoji-tray-header button").addEventListener("click", () => tray.remove());
   $("#conversation").appendChild(tray);
 }
 async function toggleRecording() {
