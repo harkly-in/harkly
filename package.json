@@ -11,8 +11,8 @@
   "license": "AGPL-3.0-only",
   "type": "commonjs",
   "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=10.0.0"
+    "node": "20.x",
+    "npm": "10.x"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
